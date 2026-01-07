@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastica_torch"
-version = "0.1.0"
+version = "0.1.1"
 description = "PyTorch implementation of the FastICA algorithm for Independent Component Analysis"
 readme = "README.md"
 license = {text = "MIT"}
