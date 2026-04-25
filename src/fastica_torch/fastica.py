@@ -358,7 +358,8 @@ def _ica_def(
     g: Callable,
     fun_args: Dict,
     max_iter: int,
-    w_init: Tensor
+    w_init: Tensor,
+    progress: bool = False,
 ) -> Tuple[Tensor, int]:
     """
     Deflationary FastICA: Extracts components one by one.
@@ -392,49 +393,68 @@ def _ica_def(
     device = X.device
     W = torch.zeros((n_components, n_components), dtype=dtype, device=device)
     n_iter = []
+    progress_bar = None
+    if progress:
+        from tqdm.auto import tqdm
+
+        progress_bar = tqdm(
+            total=n_components * max_iter,
+            desc="FastICA deflation",
+            unit="iter",
+            dynamic_ncols=True,
+        )
 
     # Loop over each component to extract
-    for j in range(n_components):
-        w = w_init[j, :].clone()
-        
-        # Normalize
-        w /= torch.sqrt((w**2).sum())
-
-        i = 0
-        for i in range(max_iter):
-            # Project data onto current w
-            # Shape: (n_features,) @ (n_features, n_samples) -> (n_samples,)
-            wtx = w @ X
-            
-            # Apply non-linearity
-            # gx shape: (n_samples,)
-            # g_wtx shape: scalar (mean)
-            gx, g_wtx = g(wtx, fun_args)
-            
-            # Update rule for deflation:
-            # w+ = E[x * g(w^T x)] - E[g'(w^T x)] * w
-            #
-            # X * gx is (n_features, n_samples) * (n_samples,) [broadcasting]
-            # Mean is over samples (dim=1)
-            
-            w1 = (X * gx.unsqueeze(0)).mean(dim=1) - g_wtx.mean() * w
-            
-            # Decorrelate w1 with respect to previously found vectors W[:j]
-            w1 = _gs_decorrelation(w1, W, j)
+    try:
+        for j in range(n_components):
+            w = w_init[j, :].clone()
             
             # Normalize
-            w1 /= torch.sqrt((w1**2).sum())
+            w /= torch.sqrt((w**2).sum())
+
+            i = 0
+            for i in range(max_iter):
+                # Project data onto current w
+                # Shape: (n_features,) @ (n_features, n_samples) -> (n_samples,)
+                wtx = w @ X
+                
+                # Apply non-linearity
+                # gx shape: (n_samples,)
+                # g_wtx shape: scalar (mean)
+                gx, g_wtx = g(wtx, fun_args)
+                
+                # Update rule for deflation:
+                # w+ = E[x * g(w^T x)] - E[g'(w^T x)] * w
+                #
+                # X * gx is (n_features, n_samples) * (n_samples,) [broadcasting]
+                # Mean is over samples (dim=1)
+                
+                w1 = (X * gx.unsqueeze(0)).mean(dim=1) - g_wtx.mean() * w
+                
+                # Decorrelate w1 with respect to previously found vectors W[:j]
+                w1 = _gs_decorrelation(w1, W, j)
+                
+                # Normalize
+                w1 /= torch.sqrt((w1**2).sum())
+                
+                # Check convergence
+                # Convergence happens if w1 is parallel to w (dot product is 1 or -1)
+                lim = torch.abs(torch.abs((w1 * w).sum()) - 1)
+                w = w1
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(component=j, lim=f"{lim.item():.2e}")
+                
+                if lim < tol:
+                    if progress_bar is not None:
+                        progress_bar.update(max_iter - i - 1)
+                    break
             
-            # Check convergence
-            # Convergence happens if w1 is parallel to w (dot product is 1 or -1)
-            lim = torch.abs(torch.abs((w1 * w).sum()) - 1)
-            w = w1
-            
-            if lim < tol:
-                break
-        
-        n_iter.append(i + 1)
-        W[j, :] = w
+            n_iter.append(i + 1)
+            W[j, :] = w
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
 
     return W, max(n_iter)
 
@@ -445,7 +465,8 @@ def _ica_par(
     g: Callable,
     fun_args: Dict,
     max_iter: int,
-    w_init: Tensor
+    w_init: Tensor,
+    progress: bool = False,
 ) -> Tuple[Tensor, int]:
     """
     Parallel FastICA: Extracts all components simultaneously.
@@ -485,7 +506,19 @@ def _ica_par(
     # If using torch.mean, we don't need explicit division by p_.
     
     ii = 0
-    for ii in range(max_iter):
+    iterator = range(max_iter)
+    if progress:
+        from tqdm.auto import tqdm
+
+        iterator = tqdm(
+            iterator,
+            total=max_iter,
+            desc="FastICA parallel",
+            unit="iter",
+            dynamic_ncols=True,
+        )
+
+    for ii in iterator:
         # 1. Project data onto all components
         # (n_comp, n_feat) @ (n_feat, n_samples) -> (n_comp, n_samples)
         wtx = W @ X
@@ -522,6 +555,8 @@ def _ica_par(
         dot_products = torch.sum(W1 * W, dim=1)
         
         lim = torch.max(torch.abs(torch.abs(dot_products) - 1))
+        if progress:
+            iterator.set_postfix(lim=f"{lim.item():.2e}")
         
         W = W1
         if lim < tol:
@@ -581,6 +616,9 @@ class FastICA(nn.Module):
             likely to happen with large tensors. Defaults to True.
         random_state (int, optional):
             Seed for random number generator.
+        progress (bool):
+            If True, show a tqdm progress bar during the ICA fixed-point
+            optimization loop.
 
     Attributes:
         components_ (Tensor):
@@ -610,6 +648,7 @@ class FastICA(nn.Module):
         svd_solver: str = "auto",
         float64_covariance: bool = False,
         random_state: Optional[int] = None,
+        progress: bool = False,
     ):
         super().__init__()
         self.n_components = n_components
@@ -624,6 +663,7 @@ class FastICA(nn.Module):
         self.svd_solver = svd_solver
         self.float64_covariance = float64_covariance
         self.random_state = random_state
+        self.progress = progress
         
         # Attributes to be set during adaptation
         self.components_: Optional[Tensor] = None
@@ -816,6 +856,7 @@ class FastICA(nn.Module):
             "fun_args": fun_args,
             "max_iter": self.max_iter,
             "w_init": w_init,
+            "progress": self.progress,
         }
         
         # ----------------------------------------------------------------------
