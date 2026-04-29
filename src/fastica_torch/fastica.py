@@ -557,7 +557,9 @@ def _ica_par(
         lim = torch.max(torch.abs(torch.abs(dot_products) - 1))
         if progress:
             iterator.set_postfix(lim=f"{lim.item():.2e}")
-        
+        if not torch.isfinite(lim) or lim.item() > 1e20:
+            raise RuntimeError(f"FastICA diverged at iter {ii}: lim={lim.item():.3e}")
+
         W = W1
         if lim < tol:
             break
