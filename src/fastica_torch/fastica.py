@@ -221,6 +221,11 @@ def _sym_decorrelation(W: Tensor) -> Tensor:
     # 3. K^{-1/2} = U @ S^{-1/2} @ U.T
     # ---------------------------------------------------------
 
+    # Eigenvalues drifting slightly negative due to floating point error in large matrix
+    # To avoid explosion, use float64 in this function
+    dtype = W.dtype
+    W = W.to(torch.float64)
+
     # Eigen decomposition of the Gram matrix
     # W (n_comp, n_feat) @ W.T (n_feat, n_comp) -> (n_comp, n_comp)
     gram = W @ W.T
@@ -252,7 +257,7 @@ def _sym_decorrelation(W: Tensor) -> Tensor:
     # Shape: (n_comp, n_comp) @ (n_comp, n_features) -> (n_comp, n_features)
     W_orth = K_inv_sqrt @ W
     
-    return W_orth
+    return W_orth.to(dtype)
 
 
 def _logcosh(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
