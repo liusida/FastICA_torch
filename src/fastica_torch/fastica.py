@@ -472,6 +472,7 @@ def _ica_par(
     max_iter: int,
     w_init: Tensor,
     progress: bool = False,
+    lim_history: Optional[list] = None,
 ) -> Tuple[Tensor, int]:
     """
     Parallel FastICA: Extracts all components simultaneously.
@@ -560,6 +561,8 @@ def _ica_par(
         dot_products = torch.sum(W1 * W, dim=1)
         
         lim = torch.max(torch.abs(torch.abs(dot_products) - 1))
+        if lim_history is not None:
+            lim_history.append(float(lim.detach().cpu()))
         if progress:
             iterator.set_postfix(lim=f"{lim.item():.2e}")
         if not torch.isfinite(lim) or lim.item() > 1e20:
@@ -679,6 +682,7 @@ class FastICA(nn.Module):
         self.whitening_: Optional[Tensor] = None
         self._unmixing: Optional[Tensor] = None
         self.n_iter_: Optional[int] = None
+        self.lim_history_: list[float] = []
         
     def _fit_transform(self, X: Tensor, compute_sources: bool = False) -> Optional[Tensor]:
         """
@@ -869,7 +873,9 @@ class FastICA(nn.Module):
         # ----------------------------------------------------------------------
         # ICA Optimization Loop
         # ----------------------------------------------------------------------
+        self.lim_history_ = []
         if self.algorithm == "parallel":
+            kwargs["lim_history"] = self.lim_history_
             W, n_iter = _ica_par(X1, **kwargs)
         elif self.algorithm == "deflation":
             W, n_iter = _ica_def(X1, **kwargs)
