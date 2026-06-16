@@ -357,6 +357,54 @@ def _cube(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
     return x**3, (3 * x**2).mean(dim=-1)
 
 
+def _positive_logcosh(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
+    """
+    One-sided logcosh contrast using only positive projections.
+
+    This is an experimental oriented contrast: ``w`` and ``-w`` no longer
+    receive the same score because negative projections are clipped to zero.
+    """
+    if fun_args is None:
+        fun_args = {}
+    alpha = fun_args.get("alpha", 1.0)
+
+    xp = torch.relu(x)
+    active = (x > 0).to(x.dtype)
+    scaled = alpha * xp
+    tanh_scaled = torch.tanh(scaled)
+    gx = tanh_scaled * active
+    g_x = (alpha * (1 - tanh_scaled**2) * active).mean(dim=-1)
+    return gx, g_x
+
+
+def _positive_exp(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
+    """
+    One-sided exp contrast using only positive projections.
+
+    G(x) = -exp(-relu(x)^2 / 2)
+    g(x) = relu(x) * exp(-relu(x)^2 / 2)
+    """
+    xp = torch.relu(x)
+    active = (x > 0).to(x.dtype)
+    exp = torch.exp(-(xp**2) / 2)
+    gx = xp * exp
+    g_x = ((1 - xp**2) * exp * active).mean(dim=-1)
+    return gx, g_x
+
+
+def _positive_cube(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
+    """
+    One-sided cube contrast using only positive projections.
+
+    G(x) = relu(x)^4 / 4
+    g(x) = relu(x)^3
+    g'(x) = 3 * relu(x)^2 for x > 0, else 0
+    """
+    xp = torch.relu(x)
+    active = (x > 0).to(x.dtype)
+    return xp**3, (3 * xp**2 * active).mean(dim=-1)
+
+
 def _ica_def(
     X: Tensor,
     tol: float,
@@ -718,6 +766,12 @@ class FastICA(nn.Module):
             g = _exp
         elif self.fun == "cube":
             g = _cube
+        elif self.fun in {"positive_logcosh", "pos_logcosh", "relu_logcosh"}:
+            g = _positive_logcosh
+        elif self.fun in {"positive_exp", "pos_exp", "relu_exp"}:
+            g = _positive_exp
+        elif self.fun in {"positive_cube", "pos_cube", "relu_cube"}:
+            g = _positive_cube
         elif callable(self.fun):
             g = self.fun
         else:
