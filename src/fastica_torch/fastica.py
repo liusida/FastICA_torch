@@ -59,6 +59,7 @@ Example
 RH 2024
 """
 
+import os
 import warnings
 from typing import Optional, Union, Tuple, Callable, Dict, List
 
@@ -189,7 +190,7 @@ def _gs_decorrelation(
     return w
 
 
-def _sym_decorrelation(W: Tensor) -> Tensor:
+def _sym_decorrelation(W: Tensor, eps: float = 1e-7) -> Tensor:
     """
     Perform symmetric decorrelation on the matrix ``W``.
     
@@ -221,26 +222,74 @@ def _sym_decorrelation(W: Tensor) -> Tensor:
     # 3. K^{-1/2} = U @ S^{-1/2} @ U.T
     # ---------------------------------------------------------
 
+    debug = os.environ.get("FASTICA_DEBUG_SYM_DECORRELATION", "").lower() in {"1", "true", "yes", "on"}
+
+    def summarize(name: str, value: Tensor) -> str:
+        detached = value.detach()
+        finite_mask = torch.isfinite(detached)
+        total = detached.numel()
+        finite_count = int(finite_mask.sum().item())
+        nan_count = int(torch.isnan(detached).sum().item())
+        posinf_count = int(torch.isposinf(detached).sum().item())
+        neginf_count = int(torch.isneginf(detached).sum().item())
+        parts = [
+            f"{name}: shape={tuple(detached.shape)}",
+            f"dtype={detached.dtype}",
+            f"device={detached.device}",
+            f"finite={finite_count}/{total}",
+            f"nan={nan_count}",
+            f"+inf={posinf_count}",
+            f"-inf={neginf_count}",
+        ]
+        if finite_count:
+            finite = detached[finite_mask].to(device="cpu", dtype=torch.float64)
+            parts.extend(
+                [
+                    f"min={torch.min(finite).item():.4e}",
+                    f"p01={torch.quantile(finite, 0.01).item():.4e}",
+                    f"median={torch.median(finite).item():.4e}",
+                    f"p99={torch.quantile(finite, 0.99).item():.4e}",
+                    f"max={torch.max(finite).item():.4e}",
+                ]
+            )
+        return ", ".join(parts)
+
+    def debug_print(name: str, value: Tensor) -> None:
+        if debug or not bool(torch.isfinite(value).all().item()):
+            print(f"[fastica_torch._sym_decorrelation] {summarize(name, value)}", flush=True)
+
+    debug_print("input_W_original", W)
+
     # Eigenvalues drifting slightly negative due to floating point error in large matrix
     # To avoid explosion, use float64 in this function
     dtype = W.dtype
     W = W.to(torch.float64)
+    debug_print("input_W_float64", W)
 
     # Eigen decomposition of the Gram matrix
     # W (n_comp, n_feat) @ W.T (n_feat, n_comp) -> (n_comp, n_comp)
     gram = W @ W.T
+    debug_print("gram", gram)
     
     # s: eigenvalues (n_comp,)
     # u: eigenvectors (n_comp, n_comp)
     s, u = torch.linalg.eigh(gram)
+    debug_print("eigvals_raw", s)
+    debug_print("eigvecs", u)
     
-    # Clip small eigenvalues to avoid numerical instability
-    tiny = torch.finfo(W.dtype).tiny
-    s = torch.clamp(s, min=tiny)
+    # Clip small eigenvalues to avoid numerical instability. The floor is
+    # relative to the largest Gram eigenvalue; using float64 tiny here can
+    # create inv_sqrt values around 1e154 and overflow when casting back to
+    # float32.
+    eps_tensor = torch.as_tensor(float(eps), dtype=s.dtype, device=s.device)
+    eig_floor = eps_tensor * torch.max(s).clamp_min(1.0)
+    s = torch.clamp(s, min=eig_floor)
+    debug_print("eigvals_clamped", s)
 
     # Compute inverse square root of eigenvalues
     # Shape: (n_comp,)
     inv_sqrt_s = 1.0 / torch.sqrt(s)
+    debug_print("inv_sqrt_eigvals", inv_sqrt_s)
     
     # Construct (W @ W.T)^{-1/2}
     # U @ S^{-1/2} @ U.T
@@ -252,12 +301,16 @@ def _sym_decorrelation(W: Tensor) -> Tensor:
     
     # Shape: (n_comp, n_comp)
     K_inv_sqrt = (u * inv_sqrt_s) @ u.T
+    debug_print("K_inv_sqrt", K_inv_sqrt)
     
     # Apply to W
     # Shape: (n_comp, n_comp) @ (n_comp, n_features) -> (n_comp, n_features)
     W_orth = K_inv_sqrt @ W
+    debug_print("W_orth_float64", W_orth)
     
-    return W_orth.to(dtype)
+    W_orth = W_orth.to(dtype)
+    debug_print("W_orth_original_dtype", W_orth)
+    return W_orth
 
 
 def _logcosh(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
@@ -521,6 +574,7 @@ def _ica_par(
     w_init: Tensor,
     progress: bool = False,
     lim_history: Optional[list] = None,
+    sym_decorrelation_eps: float = 1e-7,
 ) -> Tuple[Tensor, int]:
     """
     Parallel FastICA: Extracts all components simultaneously.
@@ -550,7 +604,7 @@ def _ica_par(
                 Number of iterations taken.
     """
     # Initialize W with symmetric decorrelation to ensure starting orthonormality
-    W = _sym_decorrelation(w_init)
+    W = _sym_decorrelation(w_init, eps=sym_decorrelation_eps)
     
     # p_ is the number of samples, used for correct scaling if needed, 
     # though mean() handles 1/N.
@@ -598,7 +652,7 @@ def _ica_par(
         
         # 4. Symmetric decorrelation (Orthogonalization)
         # This prevents components from collapsing onto the same subspace
-        W1 = _sym_decorrelation(W1)
+        W1 = _sym_decorrelation(W1, eps=sym_decorrelation_eps)
         
         # 5. Check convergence
         # We check the max change in direction for any component.
@@ -672,6 +726,9 @@ class FastICA(nn.Module):
         float64_covariance (bool):
             If True, computes covariance matrix in float64 precision to avoid overflow
             likely to happen with large tensors. Defaults to True.
+        sym_decorrelation_eps (float):
+            Relative eigenvalue floor for symmetric decorrelation. The floor is
+            ``sym_decorrelation_eps * max_eigenvalue`` of ``W @ W.T``.
         random_state (int, optional):
             Seed for random number generator.
         progress (bool):
@@ -705,6 +762,7 @@ class FastICA(nn.Module):
         whiten_solver: str = "svd",
         svd_solver: str = "auto",
         float64_covariance: bool = False,
+        sym_decorrelation_eps: float = 1e-7,
         random_state: Optional[int] = None,
         progress: bool = False,
     ):
@@ -720,6 +778,7 @@ class FastICA(nn.Module):
         self.whiten_solver = whiten_solver
         self.svd_solver = svd_solver
         self.float64_covariance = float64_covariance
+        self.sym_decorrelation_eps = sym_decorrelation_eps
         self.random_state = random_state
         self.progress = progress
         
@@ -930,6 +989,7 @@ class FastICA(nn.Module):
         self.lim_history_ = []
         if self.algorithm == "parallel":
             kwargs["lim_history"] = self.lim_history_
+            kwargs["sym_decorrelation_eps"] = self.sym_decorrelation_eps
             W, n_iter = _ica_par(X1, **kwargs)
         elif self.algorithm == "deflation":
             W, n_iter = _ica_def(X1, **kwargs)
