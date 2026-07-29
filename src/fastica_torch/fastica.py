@@ -357,6 +357,42 @@ def _cube(x: Tensor, fun_args: Dict = None) -> Tuple[Tensor, Tensor]:
     return x**3, (3 * x**2).mean(dim=-1)
 
 
+def _builtin_contrast_objective(
+    x: Tensor,
+    fun: str,
+    fun_args: Optional[Dict] = None,
+) -> Tensor:
+    """Return elementwise G(x), whose derivatives are used by FastICA."""
+    fun_args = {} if fun_args is None else fun_args
+    if fun == "logcosh":
+        alpha = fun_args.get("alpha", 1.0)
+        scaled = alpha * x
+        return (
+            torch.logaddexp(scaled, -scaled) - np.log(2.0)
+        ) / alpha
+    if fun == "exp":
+        return -torch.exp(-(x**2) / 2)
+    if fun == "cube":
+        return x**4 / 4
+    raise ValueError(f"Objective is unavailable for contrast function {fun!r}")
+
+
+def _mean_contrast_objective(
+    x: Tensor,
+    fun: str,
+    fun_args: Optional[Dict] = None,
+    max_chunk_elements: int = 16_777_216,
+) -> Tensor:
+    """Compute mean E[G(WX)] without allocating a full objective tensor."""
+    chunk_size = max(1, max_chunk_elements // x.shape[0])
+    total = torch.zeros((), dtype=x.dtype, device=x.device)
+    for chunk in x.split(chunk_size, dim=-1):
+        total = total + _builtin_contrast_objective(
+            chunk, fun, fun_args
+        ).sum()
+    return total / x.numel()
+
+
 def _ica_def(
     X: Tensor,
     tol: float,
@@ -473,6 +509,8 @@ def _ica_par(
     w_init: Tensor,
     progress: bool = False,
     lim_history: Optional[list] = None,
+    objective_fun: Optional[str] = None,
+    objective_history: Optional[list] = None,
 ) -> Tuple[Tensor, int]:
     """
     Parallel FastICA: Extracts all components simultaneously.
@@ -532,6 +570,11 @@ def _ica_par(
         # 2. Apply non-linearity
         # gwtx: (n_comp, n_samples), g_wtx: (n_comp,)
         gwtx, g_wtx = g(wtx, fun_args)
+        objective = None
+        if objective_fun is not None:
+            objective = _mean_contrast_objective(
+                wtx, objective_fun, fun_args
+            )
         
         # 3. Update rule
         # W+ = E[g(Wx)x^T] - diag(E[g'(Wx)])W
@@ -563,8 +606,13 @@ def _ica_par(
         lim = torch.max(torch.abs(torch.abs(dot_products) - 1))
         if lim_history is not None:
             lim_history.append(float(lim.detach().cpu()))
+        if objective is not None and objective_history is not None:
+            objective_history.append(float(objective.detach().cpu()))
         if progress:
-            iterator.set_postfix(lim=f"{lim.item():.2e}")
+            postfix = {"lim": f"{lim.item():.2e}"}
+            if objective is not None:
+                postfix["obj"] = f"{objective.item():.2e}"
+            iterator.set_postfix(postfix)
         if not torch.isfinite(lim) or lim.item() > 1e20:
             raise RuntimeError(f"FastICA diverged at iter {ii}: lim={lim.item():.3e}")
 
@@ -643,6 +691,9 @@ class FastICA(nn.Module):
             The pre-whitening matrix. Shape: (n_components, n_features).
         n_iter_ (int):
             Number of iterations taken to converge.
+        objective_history_ (list[float]):
+            Mean contrast objective ``E[G(WX)]`` at each parallel iteration
+            for built-in contrast functions.
     """
     def __init__(
         self,
@@ -683,6 +734,7 @@ class FastICA(nn.Module):
         self._unmixing: Optional[Tensor] = None
         self.n_iter_: Optional[int] = None
         self.lim_history_: list[float] = []
+        self.objective_history_: list[float] = []
         
     def _fit_transform(self, X: Tensor, compute_sources: bool = False) -> Optional[Tensor]:
         """
@@ -874,8 +926,12 @@ class FastICA(nn.Module):
         # ICA Optimization Loop
         # ----------------------------------------------------------------------
         self.lim_history_ = []
+        self.objective_history_ = []
         if self.algorithm == "parallel":
             kwargs["lim_history"] = self.lim_history_
+            kwargs["objective_history"] = self.objective_history_
+            if isinstance(self.fun, str):
+                kwargs["objective_fun"] = self.fun
             W, n_iter = _ica_par(X1, **kwargs)
         elif self.algorithm == "deflation":
             W, n_iter = _ica_def(X1, **kwargs)

@@ -212,6 +212,21 @@ class TestBasicFunctionality:
         assert S.shape == (n_samples, n_components)
         assert ica.components_.shape == (n_components, n_features)
         assert ica.mixing_.shape == (n_features, n_components)
+
+    def test_parallel_records_real_objective(self):
+        """Built-in contrasts expose one finite objective per iteration."""
+        torch.manual_seed(0)
+        X = torch.randn(100, 5)
+        ica = FastICA(
+            n_components=3,
+            max_iter=10,
+            random_state=42,
+        )
+
+        ica.fit(X)
+
+        assert len(ica.objective_history_) == ica.n_iter_
+        assert all(np.isfinite(value) for value in ica.objective_history_)
     
     def test_fit_then_transform_equals_fit_transform(self):
         """Test that fit().transform() gives same result as fit_transform()."""
